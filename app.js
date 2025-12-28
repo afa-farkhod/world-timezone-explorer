@@ -7,7 +7,7 @@
 
 const el = (id) => document.getElementById(id);
 
-// override table
+// override table (used for CLICKED location after reverse geocode)
 const COUNTRY_TZ_OVERRIDE = {
   kr: 9, // South Korea
   kp: 9, // North Korea
@@ -38,8 +38,8 @@ const map = L.map("map", {
   zoomControl: true,
 }).setView([22, 0], 2);
 
-// Basemap with labels (includes country names)
-L.tileLayer(
+// Basemap with labels (includes country names) + fallback tiles
+const carto = L.tileLayer(
   "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
   {
     attribution:
@@ -48,6 +48,20 @@ L.tileLayer(
     maxZoom: 20,
   }
 ).addTo(map);
+
+// Fallback tiles (OSM standard)
+const osm = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  attribution:
+    '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  maxZoom: 19,
+});
+
+let fallbackAdded = false;
+carto.on("tileerror", () => {
+  if (fallbackAdded) return;
+  fallbackAdded = true;
+  osm.addTo(map);
+});
 
 // --- Timezone band logic (approx) ---
 // produce offsets in the common range [-12..+14].
@@ -80,11 +94,12 @@ function pad2(n) {
 }
 
 function formatLocalTimeFromOffset(off, now = new Date()) {
-  // Build UTC time, then add offset hours
+  // IMPORTANT: now.getTime() is already UTC epoch milliseconds
   const utcMs = now.getTime();
   const localMs = utcMs + off * 3_600_000;
   const d = new Date(localMs);
-  // Format as YYYY-MM-DD HH:MM:SS
+
+  // Format as YYYY-MM-DD HH:MM:SS (using UTC getters because we already shifted)
   const yyyy = d.getUTCFullYear();
   const mm = pad2(d.getUTCMonth() + 1);
   const dd = pad2(d.getUTCDate());
@@ -123,7 +138,6 @@ function makeBandRect(off, isCurrent = false) {
 
 function renderAllBands() {
   bandLayer.clearLayers();
-  // All offsets from -12 to +14
   for (let off = -12; off <= 14; off++) {
     const rect = makeBandRect(off, false);
     rect.addTo(bandLayer);
@@ -145,7 +159,6 @@ function updateHoverUI(lat, lon) {
   ui.utcTime.textContent = formatUtc();
 
   if (lastHover.off !== off) {
-    // Update highlight rectangle
     if (currentBandRect) bandLayer.removeLayer(currentBandRect);
     currentBandRect = makeBandRect(off, true);
     currentBandRect.addTo(bandLayer);
@@ -166,10 +179,19 @@ map.on("mousemove", (e) => {
   });
 });
 
+// Initialize cursor panel from map center so it doesn't show "—" on first load
+{
+  const c = map.getCenter();
+  lastHover.lat = c.lat;
+  lastHover.lon = c.lng;
+  updateHoverUI(c.lat, c.lng);
+}
+
 // Update clocks every second without moving mouse (keeps UI fresh)
 setInterval(() => {
   if (lastHover.lat == null || lastHover.lon == null) return;
   updateHoverUI(lastHover.lat, lastHover.lon);
+
   // Also update clicked card time
   if (clickedState.lat != null) {
     ui.clickLocalTime.textContent = formatLocalTimeFromOffset(clickedState.off);
@@ -190,14 +212,13 @@ const clickedState = {
   lat: null,
   lon: null,
   off: null,
-  cache: new Map(), // key: "lat,lon" rounded -> result string
+  cache: new Map(), // key: "lat,lon" rounded -> result object
   lastFetchAt: 0,
 };
 
 const clickMarker = L.marker([0, 0], { opacity: 0 }).addTo(map);
 
 function cacheKey(lat, lon) {
-  // round to reduce cache fragmentation
   return `${lat.toFixed(3)},${lon.toFixed(3)}`;
 }
 
@@ -220,7 +241,7 @@ async function reverseGeocode(lat, lon) {
   url.searchParams.set("accept-language", "en");
 
   const resp = await fetch(url.toString(), {
-    headers: { "Accept": "application/json" },
+    headers: { Accept: "application/json" },
   });
   if (!resp.ok) throw new Error(`Reverse geocode failed (${resp.status})`);
   const data = await resp.json();
@@ -240,6 +261,7 @@ async function reverseGeocode(lat, lon) {
 map.on("click", async (e) => {
   const { lat, lng } = e.latlng;
   let off = offsetFromLon(lng);
+
   clickedState.lat = lat;
   clickedState.lon = lng;
   clickedState.off = off;
@@ -262,6 +284,7 @@ map.on("click", async (e) => {
       clickedState.off = off;
       ui.clickTz.textContent = fmtOffset(off);
       ui.clickLocalTime.textContent = formatLocalTimeFromOffset(off);
+    }
   } catch (err) {
     ui.place.textContent =
       "Could not reverse-geocode (network issue or rate limit).";
@@ -277,9 +300,10 @@ async function searchPlace(query) {
   url.searchParams.set("accept-language", "en");
 
   const resp = await fetch(url.toString(), {
-    headers: { "Accept": "application/json" },
+    headers: { Accept: "application/json" },
   });
   if (!resp.ok) throw new Error(`Search failed (${resp.status})`);
+
   const results = await resp.json();
   if (!results || results.length === 0) return null;
 
@@ -304,9 +328,12 @@ async function handleSearch() {
       alert("No results. Try a different query.");
       return;
     }
+
     map.setView([res.lat, res.lon], 4, { animate: true });
+
     // Populate clicked card with the found location, but keep label from search.
     const off = offsetFromLon(res.lon);
+
     clickedState.lat = res.lat;
     clickedState.lon = res.lon;
     clickedState.off = off;
@@ -331,5 +358,5 @@ ui.searchInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") handleSearch();
 });
 
-// Initial clock fill
+// Initial UTC clock fill
 ui.utcTime.textContent = formatUtc();
